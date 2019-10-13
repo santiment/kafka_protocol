@@ -115,34 +115,40 @@ with_vsn(Vsn) ->
   with_connection(
     random_config(),
     fun(Connection) ->
-        {BaseOffset, Messages} = produce_randomly(Connection),
+        {BaseOffset, Messages} = produce_randomly(Vsn, Connection),
         fetch_and_verify(Connection, Vsn, BaseOffset, Messages)
     end).
 
-produce_randomly(Connection) ->
-  produce_randomly(Connection, rand_num(?RAND_PRODUCE_BATCH_COUNT), []).
+produce_randomly(TestVsn, Connection) ->
+  produce_randomly(TestVsn, Connection, rand_num(?RAND_PRODUCE_BATCH_COUNT), []).
 
-produce_randomly(_Connection, 0, Acc0) ->
+produce_randomly(_TestVsn, _Connection, 0, Acc0) ->
   [{BaseOffset, _} | _] = Acc = lists:reverse(Acc0),
   {BaseOffset, lists:append([Msg || {_, Msg} <- Acc])};
-produce_randomly(Connection, Count, Acc) ->
+produce_randomly(TestVsn, Connection, Count, Acc) ->
   {ok, Versions} = kpro:get_api_versions(Connection),
   {MinVsn, MaxVsn} = maps:get(produce, Versions),
   Vsn = case MinVsn =:= MaxVsn of
           true -> MinVsn;
           false -> MinVsn + rand_num(MaxVsn - MinVsn) - 1
         end,
-  Opts = rand_produce_opts(),
+  Opts = rand_produce_opts(Vsn, TestVsn),
   Batch = make_random_batch(rand_num(?RAND_BATCH_SIZE)),
   Req = kpro_req_lib:produce(Vsn, ?TOPIC, ?PARTI, Batch, Opts),
   {ok, Rsp} = kpro:request_sync(Connection, Req, ?TIMEOUT),
   #{ error_code := no_error
    , base_offset := Offset
    } = kpro_test_lib:parse_rsp(Rsp),
-  produce_randomly(Connection, Count - 1, [{Offset, Batch} | Acc]).
+  produce_randomly(TestVsn, Connection, Count - 1, [{Offset, Batch} | Acc]).
 
-rand_produce_opts() ->
-  #{ compression => rand_element([no_compression, gzip, snappy])
+rand_produce_opts(ProduceVsn, FetchVsn) ->
+  Common = [no_compression, gzip, snappy],
+  #{ compression => rand_element(case ProduceVsn < 2 orelse FetchVsn < 2 of
+                                   %% avoid test old api with lz4
+                                   %% for more check KIP-57 - Interoperable LZ4 Framing
+                                   true -> Common;
+                                   false -> [lz4 | Common]
+                                 end)
    , required_acks => rand_element([leader_only, all_isr, 1, -1])
    }.
 
