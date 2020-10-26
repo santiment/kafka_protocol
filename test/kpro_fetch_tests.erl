@@ -18,6 +18,7 @@
 -include("kpro_private.hrl").
 
 -define(TOPIC, kpro_test_lib:get_topic()).
+-define(TOPIC_LAT, kpro_test_lib:get_topic_lat()).
 -define(PARTI, 0).
 -define(TIMEOUT, 5000).
 
@@ -26,16 +27,26 @@
 -define(RAND_KAFKA_VALUE_BYTES, 1024).
 
 fetch_test_() ->
-  {Min, Max} = get_api_vsn_range(),
+  {Min, Max} = get_api_vsn_range(?TOPIC),
   [{"version " ++ integer_to_list(V),
-    fun() -> with_vsn(V) end} || V <- lists:seq(Min, Max)].
+    fun() -> with_vsn_topic(V, ?TOPIC) end} || V <- lists:seq(Min, Max)].
+
+fetch_lat_test_() ->
+  case kpro_test_lib:is_kafka_09() of
+    true -> [];
+    false ->
+      {Min, Max} = get_api_vsn_range(?TOPIC_LAT),
+      [{"version " ++ integer_to_list(V),
+        fun() -> with_vsn_topic(V, ?TOPIC_LAT) end} || V <- lists:seq(Min, Max)]
+  end.
 
 incremental_fetch_test() ->
-  {_Min, Max} = get_api_vsn_range(),
+  {_Min, Max} = get_api_vsn_range(?TOPIC),
   case Max >= 7 of
     true ->
       with_connection(
         random_config(),
+        ?TOPIC,
         fun(Conn) -> test_incemental_fetch(Conn, Max) end);
     false -> ok
   end.
@@ -63,15 +74,15 @@ test_incemental_fetch(Connection, Vsn) ->
                                 , session_id := SessionId
                                 }}, Rsp1).
 
-fetch_and_verify(_Connection, _Vsn, _BeginOffset, []) -> ok;
-fetch_and_verify(Connection, Vsn, BeginOffset, Messages) ->
-  Batch0 = do_fetch(Connection, Vsn, BeginOffset, rand_num(1000)),
+fetch_and_verify(_Connection, _Topic, _Vsn, _BeginOffset, []) -> ok;
+fetch_and_verify(Connection, Topic, Vsn, BeginOffset, Messages) ->
+  Batch0 = do_fetch(Connection, Topic, Vsn, BeginOffset, rand_num(1000)),
   Batch = drop_older_offsets(BeginOffset, Batch0),
   [#kafka_message{offset = FirstOffset} | _] = Batch,
   ?assertEqual(FirstOffset, BeginOffset),
-  Rest = validate_messages(Batch, Messages),
+  Rest = validate_messages(Topic, Vsn, Batch, Messages),
   #kafka_message{offset = NextBeginOffset} = lists:last(Batch),
-  fetch_and_verify(Connection, Vsn, NextBeginOffset + 1, Rest).
+  fetch_and_verify(Connection, Topic, Vsn, NextBeginOffset + 1, Rest).
 
 %% kafka 0.9 may return messages having offset less than requested
 %% in case the requested offset is in the middle of a compressed batch
@@ -81,21 +92,69 @@ drop_older_offsets(Offset, [#kafka_message{offset = O} | R] = ML) ->
     false -> ML
   end.
 
-validate_messages([], Rest) -> Rest;
-validate_messages([#kafka_message{key = K, value = V} | R1], [Msg | R2]) ->
-  ok = validate_message(K, V, Msg),
-  validate_messages(R1, R2).
+validate_messages(_Topic, _FetchVsn, [], Rest) -> Rest;
+validate_messages(Topic, FetchVsn,
+                  [#kafka_message{ts_type = TType, ts = T, key = K, value = V} | R1],
+                  [{ProduceVsn, LAT, ProducedMsg} | R2]) ->
+  RefData = #{fetch_vsn => FetchVsn, produce_vsn => ProduceVsn, log_append_time => LAT},
+  FetchedMsg = #{ts_type => TType, ts => T, key => K, value => V},
+  ok = validate_message_key_val(FetchedMsg, ProducedMsg),
+  ok =
+    case ?TOPIC_LAT == Topic of
+      true -> validate_message_ts_append(RefData, FetchedMsg, ProducedMsg);
+      false -> validate_message_ts_create(RefData, FetchedMsg, ProducedMsg)
+    end,
+  validate_messages(Topic, FetchVsn, R1, R2).
 
-validate_message(K, V, {K, V}) -> ok;
-validate_message(K, V, {_T, K, V}) -> ok;
-validate_message(K, V, #{key := K, value := V}) -> ok;
-validate_message(K, V, Wat) ->
-  erlang:error(#{ fetched => {K, V}
-                , produced => Wat
-                }).
+validate_message_key_val(_F = #{key := K, value := V},
+                         _P = #{key := K, value := V}) -> ok;
+validate_message_key_val(Fetched, Produced) ->
+    erlang:error(#{ fetched => Fetched
+                  , produced => Produced
+                  }).
 
-do_fetch(Connection, Vsn, BeginOffset, MaxBytes) ->
-  Req = make_req(Vsn, BeginOffset, MaxBytes),
+% Message fetched without timestamp.
+validate_message_ts_create(
+  #{fetch_vsn := FVsn}, _F = #{ts := undefined, ts_type := undefined}, _P
+ ) when FVsn < 2 -> ok;
+% Message produced without timestamp.
+validate_message_ts_create(
+  #{produce_vsn := PVsn}, _F = #{ts := -1, ts_type := create}, _P
+ ) when PVsn < 1 -> ok;
+% Fetched and produced messages have matching timestamps.
+validate_message_ts_create(_RefData, _F = #{ts := T, ts_type := create},
+                                     _P = #{ts := T}) -> ok;
+% Something unexpected.
+validate_message_ts_create(RefData, F, P) ->
+    erlang:error(#{ ref_data => RefData
+                  , fetched => F
+                  , produced => P
+                  }).
+
+% Message fetched without timestamp.
+validate_message_ts_append(
+  #{fetch_vsn := FVsn}, _F = #{ts_type := undefined, ts := undefined}, _P
+ ) when FVsn < 2 -> ok;
+% Log Append Time not returned during produce, check only that the produced and
+% fetched timestamps differ.
+validate_message_ts_append(
+  #{produce_vsn := PVsn, log_append_time := undefined},
+  _F = #{ts := TF, ts_type := append}, _P = #{ts := TP}
+ ) when PVsn < 2, TF /= TP -> ok;
+% Log Append Time matches the fetched message timestamp and differs from
+% the produced message timestamp.
+validate_message_ts_append(#{log_append_time := T},
+                           _F = #{ts := T, ts_type := append},
+                           _P = #{ts := TP}) when T /= TP -> ok;
+% Something unexpected.
+validate_message_ts_append(RefData, F, P) ->
+    erlang:error(#{ ref_data => RefData
+                  , fetched => F
+                  , produced => P
+                  }).
+
+do_fetch(Connection, Topic, Vsn, BeginOffset, MaxBytes) ->
+  Req = make_req(Vsn, Topic, BeginOffset, MaxBytes),
   {ok, Rsp} = kpro:request_sync(Connection, Req, ?TIMEOUT),
   #{ header := Header
    , batches := Batches
@@ -106,14 +165,15 @@ do_fetch(Connection, Vsn, BeginOffset, MaxBytes) ->
   end,
   case Batches of
     ?incomplete_batch(Size) ->
-      do_fetch(Connection, Vsn, BeginOffset, Size);
+      do_fetch(Connection, Topic, Vsn, BeginOffset, Size);
     _ ->
       lists:append([Msgs || {_Meta, Msgs} <- Batches])
   end.
 
-with_vsn(Vsn) ->
+with_vsn_topic(Vsn, Topic) ->
   with_connection(
     random_config(),
+    Topic,
     fun(Connection) ->
         {BaseOffset, Messages} = produce_randomly(Vsn, Connection),
         fetch_and_verify(Connection, Vsn, BaseOffset, Messages)
@@ -134,8 +194,8 @@ produce_randomly(TestVsn, Connection, Count, Acc) ->
         end,
   Opts = rand_produce_opts(Vsn, TestVsn),
   Batch = make_random_batch(rand_num(?RAND_BATCH_SIZE)),
-  Req = kpro_req_lib:produce(Vsn, ?TOPIC, ?PARTI, Batch, Opts),
-  {ok, Rsp} = kpro:request_sync(Connection, Req, ?TIMEOUT),
+  Req = kpro_req_lib:produce(Vsn, Topic, ?PARTI, Batch, Opts),
+  {ok, Rsp0} = kpro:request_sync(Connection, Req, ?TIMEOUT),
   #{ error_code := no_error
    , base_offset := Offset
    } = kpro_test_lib:parse_rsp(Rsp),
@@ -156,11 +216,11 @@ rand_num(N) -> (os:system_time() rem N) + 1.
 
 rand_element(L) -> lists:nth(rand_num(length(L)), L).
 
-make_req(Vsn, Offset, MaxBytes) ->
+make_req(Vsn, Topic, Offset, MaxBytes) ->
   Opts = #{ max_wait_time => 500
           , max_bytes => MaxBytes
           },
-  kpro_req_lib:fetch(Vsn, ?TOPIC, ?PARTI, Offset, Opts).
+  kpro_req_lib:fetch(Vsn, Topic, ?PARTI, Offset, Opts).
 
 random_config() ->
   Configs0 =
@@ -173,21 +233,21 @@ random_config() ->
             end,
   rand_element(Configs).
 
-get_api_vsn_range() ->
+get_api_vsn_range(Topic) ->
   Config = kpro_test_lib:connection_config(plaintext),
   {ok, Versions} =
-    with_connection(Config, fun(Pid) -> kpro:get_api_versions(Pid) end),
+    with_connection(Config, Topic, fun(Pid) -> kpro:get_api_versions(Pid) end),
   maps:get(fetch, Versions).
 
-with_connection(Config, Fun) ->
+with_connection(Config, Topic, Fun) ->
   ConnFun =
     fun(Endpoints, Cfg) ->
-        kpro:connect_partition_leader(Endpoints, Cfg, ?TOPIC, ?PARTI)
+        kpro:connect_partition_leader(Endpoints, Cfg, Topic, ?PARTI)
     end,
   kpro_test_lib:with_connection(Config, ConnFun, Fun).
 
 make_random_batch(Count) ->
-  [#{ ts => kpro_lib:now_ts()
+  [#{ ts => kpro_lib:now_ts() - rand_num(100)
     , key => uniq_bin()
     , value => rand_bin()
     } || _ <- lists:seq(1, Count)].
