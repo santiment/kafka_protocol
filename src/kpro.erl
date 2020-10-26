@@ -100,6 +100,7 @@
              , int64/0
              , isolation_level/0
              , key/0
+             , leader_epoch/0
              , magic/0
              , message/0
              , msg_input/0
@@ -184,7 +185,8 @@
 -type wait() :: non_neg_integer().
 -type required_acks() :: -1..1 | all_isr | none | leader_only.
 -type primitive() :: integer() | string() | binary() | atom().
--type field_name() :: atom().
+-type field_tag() :: integer().
+-type field_name() :: atom() | field_tag().
 -type field_value() :: primitive() | [primitive()] | struct() | [struct()].
 -type struct() :: #{field_name() => field_value()}
                 | [{field_name(), field_value()}].
@@ -205,7 +207,8 @@
                         | string
                         | nullable_string
                         | bytes
-                        | records.
+                        | records
+                        | unsigned_varint.
 -type decode_fun() :: fun((binary()) -> {field_value(), binary()}).
 -type struct_schema() :: [{field_name(), schema()}].
 -type schema() :: primitive_type()
@@ -223,6 +226,7 @@
 -type group_id() :: binary().
 -type transactional_id() :: binary().
 -type producer_epoch() :: int16().
+-type leader_epoch() :: int32().
 -type txn_ctx() :: #{ connection => connection()
                     , transactional_id => transactional_id()
                     , producer_id => producer_id()
@@ -288,7 +292,7 @@ encode_request(ClientId, CorrId, Req) ->
 %% @doc Encode message batch for produce request.
 -spec encode_batch(magic(), batch_input(), compress_option()) -> binary().
 encode_batch(Magic, Batch, Compression) ->
-  kpro_batch:encode(Magic, Batch, Compression).
+  iolist_to_binary(kpro_batch:encode(Magic, Batch, Compression)).
 
 %% @doc The message-set is not decoded upon receiving (in connection process).
 %% It is passed as binary to the consumer process and decoded there.

@@ -17,28 +17,35 @@
 %% create_topics
 %% delete_topics
 %% delete_records
+%% describe_configs
+%% alter_configs
 -module(kpro_topic_mngr_tests).
 
 -include_lib("eunit/include/eunit.hrl").
 -include("kpro_private.hrl").
 
+-define(RESOURCE_TYPE_TOPIC, 2).
+
 %% Create a random-name partition with 1 partition 1 replica
 %% Increase partition number to 2
-create_topic_partition_test() ->
+create_topic_partition_test_() ->
   CreateTopicsVsn = get_max_api_vsn(create_topics),
   CreatePartitionsVsn = get_max_api_vsn(create_partitions),
-  test_create_topic_partition(CreateTopicsVsn, CreatePartitionsVsn).
+  {timeout, 30,
+   fun() ->
+       test_create_topic_partition(CreateTopicsVsn, CreatePartitionsVsn)
+   end}.
 
 test_create_topic_partition(false, _) ->
   io:format(user, " skipped ", []);
 test_create_topic_partition(CreateTopicsVsn, CreatePartitionsVsn) ->
   Topic = make_random_topic_name(),
   CreateTopicArgs =
-    #{ topic => Topic
+    #{ name => Topic
      , num_partitions => 1
      , replication_factor => 1
-     , replica_assignment => []
-     , config_entries => []
+     , assignments => []
+     , configs => []
      },
   AssignNewPartitionsTo = [[ _BrokerId = 0 ]],
   CreatePartitionArgs =
@@ -66,6 +73,68 @@ test_create_topic_partition(CreateTopicsVsn, CreatePartitionsVsn) ->
           false ->
             ok
         end
+    end).
+
+%% Get all configurations for a topic.
+describe_configs_test() ->
+  Vsn = get_max_api_vsn(describe_configs),
+  test_describe_configs(Vsn).
+
+test_describe_configs(false) ->
+  io:format(user, " skipped ", []);
+test_describe_configs(Vsn) ->
+  {ok, [Topic | _]} = get_test_topics(),
+  DescribeConfigArgs =
+    #{ resource_type => ?RESOURCE_TYPE_TOPIC
+     , resource_name => Topic
+     , config_names => ?null %% Get all configs
+     },
+  Opts = #{include_synonyms => false},
+  Req = kpro_req_lib:describe_configs(Vsn, [DescribeConfigArgs], Opts),
+  kpro_test_lib:with_connection(
+    fun(Endpoints, Config) -> kpro:connect_controller(Endpoints, Config) end,
+    fun(Conn) ->
+        {ok, Rsp} = kpro:request_sync(Conn, Req, infinity),
+        Resources = kpro_test_lib:parse_rsp(Rsp),
+        ?assertMatch([#{ resource_name := Topic }], Resources)
+    end).
+
+%% Alter the configuration for a topic.
+alter_configs_test() ->
+  Vsn = get_max_api_vsn(alter_configs),
+  test_alter_configs(Vsn).
+
+test_alter_configs(false) ->
+  io:format(user, " skipped ", []);
+test_alter_configs(Vsn) ->
+  {ok, [Topic | _]} = get_test_topics(),
+  AlterConfigsArgs =
+    fun(Policy) ->
+        #{ resource_type => ?RESOURCE_TYPE_TOPIC
+         , resource_name => Topic
+         , config_entries => [#{config_name => "cleanup.policy",
+                                config_value => Policy}]
+         }
+    end,
+  Opts = #{validate_only => false},
+  Req = fun(Policy) ->
+            kpro_req_lib:alter_configs(Vsn, [AlterConfigsArgs(Policy)], Opts)
+        end,
+  DescribeVsn = get_max_api_vsn(describe_configs),
+  GetPolicy = fun(Conn) ->
+                  get_topic_config(DescribeVsn, Conn, Topic, "cleanup.policy")
+              end,
+  kpro_test_lib:with_connection(
+    fun(Endpoints, Config) -> kpro:connect_controller(Endpoints, Config) end,
+    fun(Conn) ->
+        Before = GetPolicy(Conn),
+        After = case Before of
+                  <<"delete">> -> <<"compact">>;
+                  <<"compact">> -> <<"delete">>
+                end,
+        {ok, Rsp} = kpro:request_sync(Conn, Req(After), infinity),
+        ok = kpro_test_lib:parse_rsp(Rsp),
+        ?assertEqual(After, GetPolicy(Conn))
     end).
 
 %% Delete all topics created in this test module.
@@ -111,15 +180,15 @@ get_test_topics(Connection) ->
           kpro_connection:request_sync(Connection, Req, 5000)
       end
     , fun(#kpro_rsp{msg = Meta}) ->
-          Topics = kpro:find(topic_metadata, Meta),
+          Topics = kpro:find(topics, Meta),
           Result =
             lists:foldl(
               fun(Topic, Acc) ->
                   ErrorCode = kpro:find(error_code, Topic),
                   ErrorCode = ?no_error, %% assert
-                  Name = kpro:find(topic, Topic),
+                  Name = kpro:find(name, Topic),
                   case lists:prefix(atom_to_list(?MODULE),
-                                   binary_to_list(Name)) of
+                                    binary_to_list(Name)) of
                     true -> [Name | Acc];
                     false -> Acc
                   end
@@ -140,6 +209,20 @@ get_max_api_vsn(API) ->
   Max.
 
 rand() -> rand:uniform(1000000).
+
+get_topic_config(false, _, _, _) ->
+  false;
+get_topic_config(Vsn, Conn, Topic, ConfigName) ->
+  DescribeConfigArgs =
+    #{ resource_type => ?RESOURCE_TYPE_TOPIC
+     , resource_name => Topic
+     , config_names => [ConfigName]
+     },
+  Req = kpro_req_lib:describe_configs(Vsn, [DescribeConfigArgs], #{}),
+  {ok, Rsp} = kpro:request_sync(Conn, Req, infinity),
+  [Resource] = kpro_test_lib:parse_rsp(Rsp),
+  [Entry] = kpro:find(config_entries, Resource),
+  kpro:find(config_value, Entry).
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:

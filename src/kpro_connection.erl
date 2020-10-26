@@ -1,5 +1,5 @@
 %%%
-%%%   Copyright (c) 2014-2018, Klarna AB
+%%%   Copyright (c) 2014-2020, Klarna AB
 %%%
 %%%   Licensed under the Apache License, Version 2.0 (the "License");
 %%%   you may not use this file except in compliance with the License.
@@ -247,7 +247,7 @@ query_api_versions(Sock, Mod, ClientId, Timeout) ->
   ErrorCode = find(error_code, Rsp),
   case ErrorCode =:= ?no_error of
     true ->
-      Versions = find(api_versions, Rsp),
+      Versions = find(api_keys, Rsp),
       F = fun(V, Acc) ->
           API = find(api_key, V),
           MinVsn = find(min_version, V),
@@ -276,12 +276,25 @@ get_tcp_mod(_)                -> gen_tcp.
 %% (otherwise the IP will be used, which is almost certainly
 %% incorrect).
 insert_server_name_indication(SslOpts, Host) ->
-  case proplists:get_value(verify, SslOpts) of
-    verify_peer ->
-      [{server_name_indication, Host} | SslOpts];
+  VerifyOpt = proplists:get_value(verify, SslOpts),
+  insert_server_name_indication(VerifyOpt, SslOpts, Host).
+
+insert_server_name_indication(verify_peer, SslOpts, Host) ->
+  case proplists:get_value(server_name_indication, SslOpts) of
+    undefined ->
+      %% insert {server_name_indication, Host} if not already present
+      [{server_name_indication, ensure_string(Host)} | SslOpts];
     _ ->
       SslOpts
-  end.
+  end;
+
+insert_server_name_indication(_, SslOpts, _) ->
+  SslOpts.
+
+%% inet:hostname() is atom() | string()
+%% however sni() is only allowed to be string()
+ensure_string(Host) when is_atom(Host) -> atom_to_list(Host);
+ensure_string(Host) -> Host.
 
 maybe_upgrade_to_ssl(Sock, _Mod = ssl, SslOpts0, Host, Timeout) ->
   SslOpts = case SslOpts0 of
@@ -391,22 +404,28 @@ handle_msg({From, {send, Request}},
                  , requests  = Requests
                  } = State, Debug) ->
   {Caller, _Ref} = From,
+  #kpro_req{api = API, vsn = Vsn} = Request,
   {CorrId, NewRequests} =
     case Request of
       #kpro_req{no_ack = true} ->
         kpro_sent_reqs:increment_corr_id(Requests);
-      #kpro_req{ref = Ref, api = API, vsn = Vsn} ->
+      #kpro_req{ref = Ref} ->
         kpro_sent_reqs:add(Requests, Caller, Ref, API, Vsn)
     end,
-  RequestBin = kpro_req_lib:encode(ClientId, CorrId, Request),
+  RequestIoData = kpro_req_lib:encode(ClientId, CorrId, Request),
   Res = case Mod of
-          gen_tcp -> gen_tcp:send(Sock, RequestBin);
-          ssl     -> ssl:send(Sock, RequestBin)
+          gen_tcp -> gen_tcp:send(Sock, RequestIoData);
+          ssl     -> ssl:send(Sock, RequestIoData)
         end,
   case Res of
     ok ->
       maybe_reply(From, ok);
-    {error, Reason} ->
+    {error, Reason0} ->
+      Reason = [ {api, API}
+               , {vsn, Vsn}
+               , {caller, Caller}
+               , {reason, Reason0}
+               ],
       exit({send_error, Reason})
   end,
   ?MODULE:loop(State#state{requests = NewRequests}, Debug);

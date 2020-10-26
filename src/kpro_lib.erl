@@ -1,5 +1,5 @@
 %%%
-%%%   Copyright (c) 2018, Klarna AB
+%%%   Copyright (c) 2018-2020, Klarna AB
 %%%
 %%%   Licensed under the Apache License, Version 2.0 (the "License");
 %%%   you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 -module(kpro_lib).
 
 -export([ copy_bytes/2
-        , data_size/1
         , decode/2
         , decode_corr_id/1
         , encode/2
@@ -77,9 +76,9 @@ send_and_recv_raw(Req, Sock, Mod, Timeout) ->
 send_and_recv(#kpro_req{api = API, vsn = Vsn} = Req,
                  Sock, Mod, ClientId, Timeout) ->
   CorrId = make_corr_id(),
-  ReqBin = kpro_req_lib:encode(ClientId, CorrId, Req),
+  ReqIoData = kpro_req_lib:encode(ClientId, CorrId, Req),
   try
-    RspBin = send_and_recv_raw(ReqBin, Sock, Mod, Timeout),
+    RspBin = send_and_recv_raw(ReqIoData, Sock, Mod, Timeout),
     {CorrId, Body} = decode_corr_id(RspBin), %% assert match CorrId
     #kpro_rsp{api = API, vsn = Vsn, msg = Msg} = %% assert match API and Vsn
       kpro_rsp_lib:decode(API, Vsn, Body, _DummyRef = false),
@@ -126,11 +125,6 @@ parse_endpoints(Protocol, Str) ->
         end
     end, [], string:tokens(Str, ",\n")).
 
-%% @doc Return number of bytes in the given `iodata()'.
--spec data_size(iodata()) -> count().
-data_size(IoData) ->
-  iolist_size(IoData).
-
 %% @doc Encode primitives.
 -spec encode(primitive_type(), kpro:primitive()) -> iodata().
 encode(boolean, true) -> <<1:8/?INT>>;
@@ -140,25 +134,37 @@ encode(int16, I) when is_integer(I) -> <<I:16/?INT>>;
 encode(int32, I) when is_integer(I) -> <<I:32/?INT>>;
 encode(int64, I) when is_integer(I) -> <<I:64/?INT>>;
 encode(varint, I) when is_integer(I) -> kpro_varint:encode(I);
+encode(unsigned_varint, I) when is_integer(I) -> kpro_varint:encode_unsigned(I);
 encode(nullable_string, ?null) -> <<-1:16/?INT>>;
 encode(nullable_string, Str) -> encode(string, Str);
 encode(string, Atom) when is_atom(Atom) ->
   encode(string, atom_to_binary(Atom, utf8));
-encode(string, <<>>) -> <<0:16/?INT>>;
-encode(string, L) when is_list(L) ->
-  encode(string, iolist_to_binary(L));
-encode(string, B) when is_binary(B) ->
-  Length = size(B),
-  <<Length:16/?INT, B/binary>>;
+encode(string, Str) ->
+  Length = iolist_size(Str),
+  [encode(int16, Length), Str];
 encode(bytes, ?null) -> <<-1:32/?INT>>;
+encode(compact_bytes, ?null) -> 0;
 encode(bytes, B) when is_binary(B) orelse is_list(B) ->
-  Size = data_size(B),
+  Size = iolist_size(B),
   case Size =:= 0 of
     true  -> <<-1:32/?INT>>;
     false -> [<<Size:32/?INT>>, B]
   end;
+encode(compact_bytes, B) when is_binary(B) orelse is_list(B) ->
+  [encode(unsigned_varint, iolist_size(B) + 1), B];
 encode(records, B) ->
-  encode(bytes, B).
+  encode(bytes, B);
+encode(compact_string, ?kpro_null) ->
+  error(not_nullable);
+encode(compact_nullable_string, ?kpro_null) ->
+  0;
+encode(C, S) when C =:= compact_string orelse
+                  C =:= compact_nullable_string ->
+  B = iolist_to_binary(S),
+  [encode(unsigned_varint, size(B) + 1), B];
+encode(tagged_fields, _) ->
+  %% not supported so far
+  0.
 
 %% @doc All kafka messages begin with a 32 bit correlation ID.
 -spec decode_corr_id(binary()) -> {kpro:corr_id(), binary()}.
@@ -166,7 +172,7 @@ decode_corr_id(<<ID:32/unsigned-integer, Body/binary>>) ->
   {ID, Body}.
 
 %% @doc Decode primitives.
--spec decode(kpro:primitive_type(), binary()) -> {primitive(), binary()}.
+-spec decode(tagged_fields | kpro:primitive_type(), binary()) -> {primitive(), binary()}.
 decode(boolean, Bin) ->
   <<Value:8/?INT, Rest/binary>> = Bin,
   {Value =/= 0, Rest};
@@ -184,20 +190,39 @@ decode(int64, Bin) ->
   {Value, Rest};
 decode(varint, Bin) ->
   kpro_varint:decode(Bin);
+decode(unsigned_varint, Bin) ->
+  kpro_varint:decode_unsigned(Bin);
 decode(string, Bin) ->
   <<Size:16/?INT, Rest/binary>> = Bin,
   copy_bytes(Size, Rest);
 decode(bytes, Bin) ->
   <<Size:32/?INT, Rest/binary>> = Bin,
   copy_bytes(Size, Rest);
+decode(compact_bytes, Bin) ->
+  {Length, Body} = decode(unsigned_varint, Bin),
+  true = (Length > 0), %% not nullable
+  copy_bytes(Length - 1, Body);
 decode(nullable_string, Bin) ->
   decode(string, Bin);
+decode(compact_string, Bin) ->
+  {Length, Body} = decode(unsigned_varint, Bin),
+  true = (Length > 0), %% not nullable
+  copy_bytes(Length - 1, Body);
+decode(compact_nullable_string, Bin) ->
+  {Length, Body} = decode(unsigned_varint, Bin),
+  case Length == 0 of
+    true  -> {?kpro_null, Body};
+    false -> copy_bytes(Length - 1, Body)
+  end;
 decode(records, Bin) ->
-  decode(bytes, Bin).
+  decode(bytes, Bin);
+decode(tagged_fields, Bin0) ->
+  {Count, Bin1} = decode(unsigned_varint, Bin0),
+  decode_tagged_fields(Count, Bin1, #{}).
 
 %% @doc Make a copy of the head instead of keeping referencing the original.
 -spec copy_bytes(-1 | count(), binary()) -> {binary(), binary()}.
-copy_bytes(-1, Bin) ->
+copy_bytes(Size, Bin) when Size =< 0 ->
   {<<>>, Bin};
 copy_bytes(Size, Bin) ->
   <<Bytes:Size/binary, Rest/binary>> = Bin,
@@ -378,6 +403,13 @@ do_ok_pipe(_FunList, {error, Reason}) ->
   {error, Reason}.
 
 make_corr_id() -> rand:uniform(1 bsl 31).
+
+decode_tagged_fields(0, Tail, Fields) -> {Fields, Tail};
+decode_tagged_fields(N, Tail0, Fields) ->
+  {Tag, Tail1} = decode(unsigned_varint, Tail0),
+  {Length, Tail2} = decode(unsigned_varint, Tail1),
+  {Value, Tail} = copy_bytes(Length, Tail2),
+  decode_tagged_fields(N - 1, Tail, Fields#{Tag => Value}).
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:
