@@ -74,13 +74,20 @@ java_snappy_unpack_chunks(Chunks, Acc) ->
       java_snappy_unpack_chunks(Tail, [Acc, Decompressed])
   end.
 
+% snappy_decompress(BinData) ->
+%   {ok, Decompressed} = snappyer:decompress(BinData),
+%   Decompressed.
 snappy_decompress(BinData) ->
-  {ok, Decompressed} = snappyer:decompress(BinData),
-  Decompressed.
+  BiData.
+
+
+% snappy_compress(IoData) ->
+%   {ok, Compressed} = snappyer:compress(IoData),
+  % Compressed.
+
 
 snappy_compress(IoData) ->
-  {ok, Compressed} = snappyer:compress(IoData),
-  Compressed.
+  IOData.
 
 lz4_compress(IoList) when is_list(IoList) ->
   lz4_compress(iolist_to_binary(IoList));
