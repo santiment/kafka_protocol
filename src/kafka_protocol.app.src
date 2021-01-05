@@ -2,7 +2,7 @@
              [{description,"Kafka protocol library for Erlang/Elixir"},
               {vsn,"git"},
               {registered,[]},
-              {applications,[kernel,stdlib,ssl,snappyer,crc32cer]},
+              {applications,[kernel,stdlib,ssl,crc32cer]},
               {env,[]},
               {modules,[]},
               {maintainers,["Zaiming Shi","Ivan Dyachkov"]},
